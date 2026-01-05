@@ -1,6 +1,7 @@
 import { useState, useEffect, useRef, useCallback, useImperativeHandle, forwardRef } from 'react'
 import { loadNoteFromFile, watchFiles, onFilesChanged, selectVaultFolder, getVaultPath, renameNoteFile, createNoteFile, deleteNoteFile } from '../utils/fileSystem'
-import { saveCanvasList, saveCurrentCanvas, removeNoteFromAllCanvases } from '../utils/storage'
+import { saveCanvasList, saveCurrentCanvas, removeNoteFromAllCanvases, deleteCanvas, clearStateCache, clearCanvasState } from '../utils/storage'
+import { getTitleFromFilePath, stripFileExtension } from '../utils/fileExtensions'
 import WarningModal from './WarningModal'
 
 interface FileItem {
@@ -15,23 +16,28 @@ interface SidebarProps {
   onFileRename?: (oldFilePath: string, newFilePath: string, newTitle: string) => void
   onFileDelete?: (filePath: string) => void
   onFileCreated?: (filePath: string) => void
+  onCreateNoteOnCanvas?: (filePath: string, noteType: 'markdown' | 'excalidraw') => void // Callback to create note on canvas and open editor
   currentCanvas: string
   onCanvasChange: (canvasId: string) => void
   canvases: string[]
   onCanvasListUpdate: (canvases: string[]) => void
+  isHidden?: boolean
+  onToggleHide?: () => void
+  canvasNotes?: Array<{ filePath?: string }> // Notes currently on the canvas
 }
 
 export interface SidebarHandle {
   refreshFiles: () => Promise<void>
 }
 
-const Sidebar = forwardRef<SidebarHandle, SidebarProps>(({ onOpenFile, onFileRename, onFileDelete, currentCanvas, onCanvasChange, canvases, onCanvasListUpdate }, ref) => {
-  const [activeTab, setActiveTab] = useState<'home' | 'search'>('home')
+const Sidebar = forwardRef<SidebarHandle, SidebarProps>(({ onOpenFile, onFileRename, onFileDelete, onCreateNoteOnCanvas, currentCanvas, onCanvasChange, canvases, onCanvasListUpdate, isHidden = false, onToggleHide: _onToggleHide, canvasNotes = [] }, ref) => {
+  // Removed search tab - only home tab remains
   const [files, setFiles] = useState<FileItem[]>([])
   const [fileTitles, setFileTitles] = useState<Map<string, string>>(new Map()) // Map file path to title (first line)
   const [vaultPath, setVaultPath] = useState<string>('')
   const [showVaultMenu, setShowVaultMenu] = useState(false)
   const [showDeskMenu, setShowDeskMenu] = useState(false)
+  const [showAddMenu, setShowAddMenu] = useState(false)
   const [contextMenuFile, setContextMenuFile] = useState<FileItem | null>(null)
   const [contextMenuPos, setContextMenuPos] = useState({ x: 0, y: 0 })
   const [renamingFile, setRenamingFile] = useState<string | null>(null)
@@ -42,6 +48,7 @@ const Sidebar = forwardRef<SidebarHandle, SidebarProps>(({ onOpenFile, onFileRen
   const contextMenuRef = useRef<HTMLDivElement>(null)
   const renameInputRef = useRef<HTMLInputElement>(null)
   const newCanvasInputRef = useRef<HTMLInputElement>(null)
+  const addMenuRef = useRef<HTMLDivElement>(null)
   const isSubmittingRef = useRef(false)
 
   // Load vault path on mount
@@ -61,8 +68,10 @@ const Sidebar = forwardRef<SidebarHandle, SidebarProps>(({ onOpenFile, onFileRen
     try {
       const result = await selectVaultFolder()
       if (!result.cancelled && result.vaultPath) {
+        // Clear state cache so new vault's state will be loaded fresh
+        clearStateCache()
         setVaultPath(result.vaultPath)
-        // Reload the window to apply new vault
+        // Reload the window to apply new vault and load its state
         window.location.reload()
       }
     } catch (error) {
@@ -73,26 +82,76 @@ const Sidebar = forwardRef<SidebarHandle, SidebarProps>(({ onOpenFile, onFileRen
 
   // Load titles for files
   const loadFileTitles = useCallback(async (fileList: FileItem[]) => {
+    setFileTitles(prevTitles => {
+      // Start with existing titles to preserve manually set ones
+      const titlesMap = new Map(prevTitles)
+      
+      // Load titles for files that don't have a title yet or need updating
+      fileList.forEach(file => {
+        // Only update if we don't already have a title for this path
+        // This preserves manually set titles (like after rename)
+        if (!titlesMap.has(file.path)) {
+          if (file.name.endsWith('.excalidraw.md') || file.name.endsWith('.excalidraw')) {
+            // For Excalidraw files, use filename without extension
+            const title = getTitleFromFilePath(file.name)
+            titlesMap.set(file.path, title)
+          } else {
+            // For markdown files, use filename without extension as default
+            // (will be updated by async load below if needed)
+            const fallbackTitle = file.name.endsWith('.md') ? file.name.slice(0, -3) : file.name
+            titlesMap.set(file.path, fallbackTitle)
+          }
+        }
+      })
+      
+      return titlesMap
+    })
+    
+    // Load markdown file titles asynchronously (for first line content)
     const titlesMap = new Map<string, string>()
     await Promise.all(fileList.map(async (file) => {
       try {
-        const result = await loadNoteFromFile(file.path)
-        if (result.success && result.content) {
-          const firstLine = result.content.split('\n')[0] || ''
-          const title = firstLine.trim() || (file.name.endsWith('.md') ? file.name.slice(0, -3) : file.name)
+        if (file.name.endsWith('.excalidraw.md') || file.name.endsWith('.excalidraw')) {
+          // For Excalidraw files, use filename without extension
+          const title = getTitleFromFilePath(file.name)
           titlesMap.set(file.path, title)
         } else {
-          // Fallback to filename if file is empty or can't be loaded
-          const fallbackTitle = file.name.endsWith('.md') ? file.name.slice(0, -3) : file.name
-          titlesMap.set(file.path, fallbackTitle)
+          // Markdown files - try to load first line
+          const result = await loadNoteFromFile(file.path)
+          if (result.success && result.content) {
+            const firstLine = result.content.split('\n')[0] || ''
+            const title = firstLine.trim() || (file.name.endsWith('.md') ? file.name.slice(0, -3) : file.name)
+            titlesMap.set(file.path, title)
+          } else {
+            // Fallback to filename if file is empty or can't be loaded
+            const fallbackTitle = file.name.endsWith('.md') ? file.name.slice(0, -3) : file.name
+            titlesMap.set(file.path, fallbackTitle)
+          }
         }
       } catch (error) {
         // Fallback to filename on error
-        const fallbackTitle = file.name.endsWith('.md') ? file.name.slice(0, -3) : file.name
+        const fallbackTitle = getTitleFromFilePath(file.name)
         titlesMap.set(file.path, fallbackTitle)
       }
     }))
-    setFileTitles(titlesMap)
+    
+    // Merge new titles, but preserve existing ones (manually set titles)
+    // Exception: Always update Excalidraw file titles from filename (they should always match filename)
+    setFileTitles(prevTitles => {
+      const merged = new Map(prevTitles)
+      titlesMap.forEach((title, path) => {
+        // Find the file to check its type
+        const file = fileList.find(f => f.path === path)
+        const isExcalidraw = file && (file.name.endsWith('.excalidraw.md') || file.name.endsWith('.excalidraw'))
+        
+        // Always update Excalidraw file titles to match filename (they don't have titles in content)
+        // For other files, only update if we don't already have a manually set title
+        if (isExcalidraw || !prevTitles.has(path)) {
+          merged.set(path, title)
+        }
+      })
+      return merged
+    })
   }, [])
 
   // Load and watch files
@@ -111,7 +170,7 @@ const Sidebar = forwardRef<SidebarHandle, SidebarProps>(({ onOpenFile, onFileRen
     // Set up file change listener
     const cleanup = onFilesChanged(async (newFiles) => {
       setFiles(newFiles)
-      // Reload titles when files change
+      // Reload titles when files change (loadFileTitles will preserve manually set titles)
       await loadFileTitles(newFiles)
     })
     
@@ -133,11 +192,37 @@ const Sidebar = forwardRef<SidebarHandle, SidebarProps>(({ onOpenFile, onFileRen
     refreshFiles
   }), [refreshFiles])
 
+  // Close add menu when clicking outside
+  useEffect(() => {
+    const handleClickOutside = (event: MouseEvent) => {
+      if (addMenuRef.current && !addMenuRef.current.contains(event.target as Node)) {
+        setShowAddMenu(false)
+      }
+    }
+
+    if (showAddMenu) {
+      document.addEventListener('mousedown', handleClickOutside)
+      return () => {
+        document.removeEventListener('mousedown', handleClickOutside)
+      }
+    }
+  }, [showAddMenu])
+
   const handleFileDoubleClick = async (file: FileItem) => {
-    if (onOpenFile) {
+    // Determine note type from file extension
+    // Check .excalidraw.md first (longer extension), then .excalidraw
+    const noteType = (file.name.endsWith('.excalidraw.md') || file.name.endsWith('.excalidraw')) ? 'excalidraw' : 'markdown'
+    
+    // Use onCreateNoteOnCanvas to open file as hover editor (without adding to canvas)
+    if (onCreateNoteOnCanvas) {
+      onCreateNoteOnCanvas(file.path, noteType)
+    } else if ((window as any).__createNoteOnCanvas) {
+      // Use global function exposed by MegaSurface
+      (window as any).__createNoteOnCanvas(file.path, noteType)
+    } else if (onOpenFile) {
+      // Fallback to old behavior if neither is available
       const result = await loadNoteFromFile(file.path)
       if (result.success) {
-        // Allow opening even if content is empty (for new files)
         onOpenFile(file.path, result.content || '')
       } else {
         console.error('Failed to load file:', result.error)
@@ -155,8 +240,8 @@ const Sidebar = forwardRef<SidebarHandle, SidebarProps>(({ onOpenFile, onFileRen
   const handleRename = async (file: FileItem) => {
     setContextMenuFile(null)
     setRenamingFile(file.path)
-    // Extract filename without extension
-    const fileNameWithoutExt = file.name.endsWith('.md') ? file.name.slice(0, -3) : file.name
+    // Extract filename without extension using utility function
+    const fileNameWithoutExt = stripFileExtension(file.name)
     setNewFileName(fileNameWithoutExt)
     setTimeout(() => renameInputRef.current?.focus(), 0)
   }
@@ -186,7 +271,7 @@ const Sidebar = forwardRef<SidebarHandle, SidebarProps>(({ onOpenFile, onFileRen
     }
   }
 
-  const handleAddCanvasSubmit = () => {
+  const handleAddCanvasSubmit = async () => {
     const trimmedName = newCanvasName.trim()
     
     // Validate name
@@ -208,6 +293,13 @@ const Sidebar = forwardRef<SidebarHandle, SidebarProps>(({ onOpenFile, onFileRen
     const newCanvases = [...canvases, trimmedName]
     onCanvasListUpdate(newCanvases)
     saveCanvasList(newCanvases)
+    
+    // Clear any existing state for this canvas name (in case it was previously deleted)
+    // This ensures we start with a fresh canvas, not the old one's state
+    await clearCanvasState(trimmedName)
+    
+    // Initialize new canvas with empty state (no notes, default zoom/pan)
+    // This is handled by loadNotesForCanvas returning null for new canvases
     
     // Switch to the new canvas
     onCanvasChange(trimmedName)
@@ -240,9 +332,8 @@ const Sidebar = forwardRef<SidebarHandle, SidebarProps>(({ onOpenFile, onFileRen
       // Get original filename without extension for comparison
       const originalFile = files.find(f => f.path === renamingFile)
       if (originalFile) {
-        const originalNameWithoutExt = originalFile.name.endsWith('.md') 
-          ? originalFile.name.slice(0, -3) 
-          : originalFile.name
+        // Extract original filename without extension using utility function
+        const originalNameWithoutExt = stripFileExtension(originalFile.name)
         
         // If name hasn't changed, just cancel and return to normal
         if (trimmedName === originalNameWithoutExt) {
@@ -253,12 +344,16 @@ const Sidebar = forwardRef<SidebarHandle, SidebarProps>(({ onOpenFile, onFileRen
         }
         
         // Check for duplicate names (excluding the current file)
+        // Also check if the new name matches a file with a different extension
         const duplicateFile = files.find(f => {
-          if (f.path === renamingFile) return false // Skip current file
-          const otherNameWithoutExt = f.name.endsWith('.md') 
-            ? f.name.slice(0, -3) 
-            : f.name
-          return otherNameWithoutExt === trimmedName
+          // Skip the current file being renamed
+          if (f.path === renamingFile) return false
+          
+          // Extract name without extension for comparison using utility function
+          const otherNameWithoutExt = stripFileExtension(f.name)
+          
+          // Check if names match (case-insensitive)
+          return otherNameWithoutExt.toLowerCase() === trimmedName.toLowerCase()
         })
         
         if (duplicateFile) {
@@ -274,8 +369,20 @@ const Sidebar = forwardRef<SidebarHandle, SidebarProps>(({ onOpenFile, onFileRen
       const result = await renameNoteFile(oldFilePath, trimmedName)
       
       if (result.success && result.newFilePath) {
-        // Get the new file name with extension
-        const newFileNameWithExt = trimmedName.endsWith('.md') ? trimmedName : trimmedName + '.md'
+        // Determine the original file extension to preserve it
+        const originalFile = files.find(f => f.path === renamingFile)
+        // Check for Excalidraw files (backward compatible with .excalidraw.md)
+        const isExcalidraw = (originalFile?.name.endsWith('.excalidraw.md') || originalFile?.name.endsWith('.excalidraw')) ?? false
+        // Only markdown if it's .md but NOT .excalidraw.md
+        const isMarkdown = (originalFile?.name.endsWith('.md') && !originalFile?.name.endsWith('.excalidraw.md')) ?? false
+        
+        // Get the new file name with extension (preserve original extension)
+        // New files use .excalidraw, but keep .excalidraw.md for backward compatibility
+        const newFileNameWithExt = isExcalidraw
+          ? (originalFile?.name.endsWith('.excalidraw.md') ? trimmedName + '.excalidraw.md' : trimmedName + '.excalidraw')
+          : isMarkdown
+          ? (trimmedName.endsWith('.md') ? trimmedName : trimmedName + '.md')
+          : trimmedName
         const newTitle = trimmedName // Title is filename without extension
         
         // Immediately update the local state to show new name
@@ -285,6 +392,14 @@ const Sidebar = forwardRef<SidebarHandle, SidebarProps>(({ onOpenFile, onFileRen
             ? { ...f, name: newFileNameWithExt, path: result.newFilePath! }
             : f
         ))
+        
+        // Immediately update fileTitles map with the new title
+        setFileTitles(prevTitles => {
+          const newTitles = new Map(prevTitles)
+          newTitles.delete(oldFilePath) // Remove old path
+          newTitles.set(result.newFilePath!, newTitle) // Set new path with new title
+          return newTitles
+        })
         
         // Notify Canvas to update note titles
         if (onFileRename) {
@@ -335,30 +450,12 @@ const Sidebar = forwardRef<SidebarHandle, SidebarProps>(({ onOpenFile, onFileRen
   }, [contextMenuFile])
 
   return (
-    <div className="w-64 bg-white border-r border-gray-200 flex flex-col h-full overflow-y-auto">
+    <div className={`relative bg-white border-r border-gray-200 flex flex-col h-full overflow-y-auto transition-all duration-300 ease-in-out ${
+      isHidden ? 'w-0 overflow-hidden' : 'w-64'
+    }`}>
+      {/* Sidebar Content */}
+      <div className={`flex flex-col h-full overflow-y-auto ${isHidden ? 'opacity-0 pointer-events-none' : 'opacity-100'}`}>
       {/* Navigation Tabs */}
-      <div className="flex border-b border-gray-200">
-        <button
-          onClick={() => setActiveTab('home')}
-          className={`flex-1 py-3 px-4 text-sm font-medium transition-colors ${
-            activeTab === 'home'
-              ? 'text-gray-900 border-b-2 border-gray-900'
-              : 'text-gray-500 hover:text-gray-700'
-          }`}
-        >
-          Home
-        </button>
-        <button
-          onClick={() => setActiveTab('search')}
-          className={`flex-1 py-3 px-4 text-sm font-medium transition-colors ${
-            activeTab === 'search'
-              ? 'text-gray-900 border-b-2 border-gray-900'
-              : 'text-gray-500 hover:text-gray-700'
-          }`}
-        >
-          Search
-        </button>
-      </div>
 
       <div className="flex-1 p-4 flex flex-col min-h-0">
         {/* My Desk Dropdown */}
@@ -382,25 +479,95 @@ const Sidebar = forwardRef<SidebarHandle, SidebarProps>(({ onOpenFile, onFileRen
               <div className="absolute top-full left-0 right-0 mt-1 bg-white border border-gray-200 rounded-lg shadow-lg z-50 max-h-64 overflow-y-auto">
                 <div className="py-1">
                   {/* Canvas List */}
-                  {canvases.map((canvas, index) => (
-                    <button
+                  {/* Ensure current canvas is always in the list */}
+                  {(() => {
+                    // Create a set of canvases that includes the current canvas if it's not already there
+                    const canvasesToShow = [...canvases];
+                    if (currentCanvas && !canvasesToShow.includes(currentCanvas)) {
+                      canvasesToShow.unshift(currentCanvas); // Add current canvas at the beginning
+                    }
+                    return canvasesToShow;
+                  })().map((canvas, index) => (
+                    <div
                       key={index}
-                      onClick={() => {
-                        setShowDeskMenu(false)
-                        onCanvasChange(canvas)
-                        saveCurrentCanvas(canvas)
-                      }}
-                      className={`w-full px-4 py-2 text-left text-sm transition-colors flex items-center gap-2 ${
+                      className={`group flex items-center ${
                         canvas === currentCanvas
-                          ? 'bg-primary-50 text-primary-700 font-medium'
+                          ? 'bg-primary-50 text-primary-700'
                           : 'text-gray-700 hover:bg-gray-100'
                       }`}
                     >
-                      <svg className="w-4 h-4 text-gray-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9.75 17L9 20l-1 1h8l-1-1-.75-3M3 13h18M5 17h14a2 2 0 002-2V5a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z" />
-                      </svg>
-                      <span>{canvas}</span>
-                    </button>
+                      <button
+                        draggable={true}
+                        onDragStart={(e) => {
+                          console.log('Drag start for canvas:', canvas);
+                          // Set both custom MIME type and text/plain as fallback
+                          e.dataTransfer.setData('application/canvas-id', canvas);
+                          e.dataTransfer.setData('text/plain', `canvas:${canvas}`);
+                          e.dataTransfer.effectAllowed = 'copy';
+                          console.log('Set drag data - canvas-id:', e.dataTransfer.getData('application/canvas-id'), 'text/plain:', e.dataTransfer.getData('text/plain'));
+                          // Prevent click from firing when dragging
+                          e.stopPropagation();
+                          // Don't close dropdown during drag - let it close on dragEnd
+                        }}
+                        onDragEnd={(_e) => {
+                          console.log('Drag end for canvas:', canvas);
+                          // Close dropdown after drag completes
+                          setShowDeskMenu(false);
+                        }}
+                        onClick={(e) => {
+                          // Only handle click if it wasn't a drag
+                          if (e.defaultPrevented) return;
+                          setShowDeskMenu(false)
+                          onCanvasChange(canvas)
+                          saveCurrentCanvas(canvas)
+                        }}
+                        className={`flex-1 px-4 py-2 text-left text-sm transition-colors flex items-center gap-2 ${
+                          canvas === currentCanvas
+                            ? 'font-medium'
+                            : ''
+                        }`}
+                      >
+                        <svg className="w-4 h-4 text-gray-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9.75 17L9 20l-1 1h8l-1-1-.75-3M3 13h18M5 17h14a2 2 0 002-2V5a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z" />
+                        </svg>
+                        <span>{canvas}</span>
+                      </button>
+                      {canvas !== 'My Desk' && (
+                        <button
+                          onClick={async (e) => {
+                            e.stopPropagation()
+                            e.preventDefault()
+                            
+                            if (!confirm(`Are you sure you want to delete "${canvas}"? This will remove all notes on this canvas. This action cannot be undone.`)) {
+                              return
+                            }
+                            
+                            const result = await deleteCanvas(canvas)
+                            if (result.success) {
+                              // Update canvas list
+                              const newCanvases = canvases.filter(c => c !== canvas)
+                              onCanvasListUpdate(newCanvases)
+                              
+                              // If we deleted the current canvas, switch to "My Desk"
+                              if (canvas === currentCanvas) {
+                                onCanvasChange('My Desk')
+                                await saveCurrentCanvas('My Desk')
+                              }
+                              
+                              setShowDeskMenu(false)
+                            } else {
+                              setWarningMessage(result.error || 'Failed to delete canvas')
+                            }
+                          }}
+                          className="px-2 py-2 text-gray-400 hover:text-red-600 transition-colors opacity-0 group-hover:opacity-100"
+                          title="Delete canvas"
+                        >
+                          <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
+                          </svg>
+                        </button>
+                      )}
+                    </div>
                   ))}
                   
                   {/* Divider */}
@@ -460,6 +627,16 @@ const Sidebar = forwardRef<SidebarHandle, SidebarProps>(({ onOpenFile, onFileRen
               <div
                 className="fixed inset-0 z-40"
                 onClick={() => setShowDeskMenu(false)}
+                onDragOver={(e) => {
+                  // Allow drag to pass through overlay to canvas
+                  e.preventDefault();
+                  e.stopPropagation();
+                }}
+                onDrop={(e) => {
+                  // Prevent drop on overlay, let it reach canvas
+                  e.preventDefault();
+                  e.stopPropagation();
+                }}
               />
             </>
           )}
@@ -469,78 +646,155 @@ const Sidebar = forwardRef<SidebarHandle, SidebarProps>(({ onOpenFile, onFileRen
         <div className="flex-1 flex flex-col min-h-0">
           <div className="px-3 mb-2 flex items-center justify-between">
             <h3 className="text-xs font-semibold text-gray-500 uppercase tracking-wider">Files</h3>
-            <button
-              onClick={async () => {
-                console.log('➕ Sidebar: + button clicked, creating new file...')
-                
-                // Find the next available note number
-                const getNextAvailableNoteNumber = () => {
-                  // Extract all note numbers from existing files
-                  const noteNumbers = new Set<number>()
-                  files.forEach(file => {
-                    const match = file.name.match(/^Note (\d+)\.md$/)
-                    if (match) {
-                      noteNumbers.add(parseInt(match[1], 10))
-                    }
-                  })
-                  
-                  // Find the first available number starting from 1
-                  let nextNumber = 1
-                  while (noteNumbers.has(nextNumber)) {
-                    nextNumber++
-                  }
-                  
-                  return nextNumber
-                }
-                
-                const noteNumber = getNextAvailableNoteNumber()
-                const fileName = `Note ${noteNumber}`
-                console.log('➕ Sidebar: File name will be:', fileName, '(checked existing files:', files.map(f => f.name).join(', '), ')')
-                const result = await createNoteFile(fileName)
-                console.log('➕ Sidebar: createNoteFile result:', result)
-                if (result.success && result.filePath) {
-                  // Manually add file to list immediately (file watcher will update it later with full metadata)
-                  // Use a small delay to ensure file is fully written
-                  await new Promise(resolve => setTimeout(resolve, 100))
-                  const newFile: FileItem = {
-                    name: result.filePath,
-                    path: result.filePath,
-                    modified: Date.now(),
-                    size: 0
-                  }
-                  setFiles(prevFiles => {
-                    // Check if file already exists (from file watcher)
-                    const exists = prevFiles.some(f => f.path === result.filePath)
-                    if (exists) {
-                      return prevFiles
-                    }
-                    return [...prevFiles, newFile]
-                  })
-                  
-                  // Open the new file in hover editor
-                  if (onOpenFile) {
-                    console.log('➕ Sidebar: onOpenFile callback exists, loading file content...')
-                    // Load the file content (will be empty for new files)
-                    const loadResult = await loadNoteFromFile(result.filePath)
-                    console.log('➕ Sidebar: loadNoteFromFile result:', loadResult)
-                    if (loadResult.success) {
-                      console.log('➕ Sidebar: Calling onOpenFile with filePath:', result.filePath, 'content length:', (loadResult.content || '').length)
-                      onOpenFile(result.filePath, loadResult.content || '')
-                    } else {
-                      console.error('➕ Sidebar: Failed to load file:', loadResult.error)
-                    }
-                  } else {
-                    console.error('➕ Sidebar: onOpenFile callback is not defined!')
-                  }
-                }
-              }}
-              className="p-1 hover:bg-gray-100 rounded transition-colors"
-              title="Add new file"
-            >
-              <svg className="w-4 h-4 text-gray-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 4v16m8-8H4" />
-              </svg>
-            </button>
+            <div className="relative">
+              <button
+                onClick={() => setShowAddMenu(!showAddMenu)}
+                className="p-1 hover:bg-gray-100 rounded transition-colors"
+                title="Add new file"
+              >
+                <svg className="w-4 h-4 text-gray-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 4v16m8-8H4" />
+                </svg>
+              </button>
+              
+              {/* Add Menu Dropdown */}
+              {showAddMenu && (
+                <div
+                  ref={addMenuRef}
+                  className="absolute right-0 top-8 bg-white border border-gray-200 rounded-lg shadow-lg z-50 min-w-[160px]"
+                >
+                  <button
+                    onClick={async () => {
+                      setShowAddMenu(false)
+                      console.log('➕ Sidebar: Add Note clicked, creating markdown file...')
+                      
+                      // Find the next available note number
+                      // Check both .md and .excalidraw files (backward compatible with .excalidraw.md)
+                      const getNextAvailableNoteNumber = () => {
+                        const noteNumbers = new Set<number>()
+                        files.forEach(file => {
+                          // Match Note X.md, Note X.excalidraw.md (backward compat), or Note X.excalidraw
+                          // Check longer extensions first (.excalidraw.md before .excalidraw)
+                          const match = file.name.match(/^Note (\d+)\.(excalidraw\.md|excalidraw|md)$/)
+                          if (match) {
+                            noteNumbers.add(parseInt(match[1], 10))
+                          }
+                        })
+                        
+                        let nextNumber = 1
+                        while (noteNumbers.has(nextNumber)) {
+                          nextNumber++
+                        }
+                        return nextNumber
+                      }
+                      
+                      const noteNumber = getNextAvailableNoteNumber()
+                      const fileName = `Note ${noteNumber}`
+                      const result = await createNoteFile(fileName, 'markdown')
+                      
+                      if (result.success && result.filePath) {
+                        await new Promise(resolve => setTimeout(resolve, 100))
+                        const newFile: FileItem = {
+                          name: result.filePath,
+                          path: result.filePath,
+                          modified: Date.now(),
+                          size: 0
+                        }
+                        setFiles(prevFiles => {
+                          const exists = prevFiles.some(f => f.path === result.filePath)
+                          if (exists) return prevFiles
+                          return [...prevFiles, newFile]
+                        })
+                        
+                        // Create note on canvas and open editor
+                        if (onCreateNoteOnCanvas) {
+                          onCreateNoteOnCanvas(result.filePath, 'markdown')
+                        } else if (onOpenFile) {
+                          const loadResult = await loadNoteFromFile(result.filePath)
+                          if (loadResult.success) {
+                            onOpenFile(result.filePath, loadResult.content || '')
+                          }
+                        }
+                      }
+                    }}
+                    className="w-full px-4 py-2 text-left text-sm text-gray-700 hover:bg-gray-100 transition-colors flex items-center gap-2"
+                  >
+                    <svg className="w-4 h-4 text-gray-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
+                    </svg>
+                    Add Note
+                  </button>
+                  <button
+                    onClick={async () => {
+                      setShowAddMenu(false)
+                      console.log('➕ Sidebar: Add Drawing clicked, creating Excalidraw file...')
+                      
+                      // Find the next available note number
+                      // Check both .md and .excalidraw files (backward compatible with .excalidraw.md)
+                      const getNextAvailableNoteNumber = () => {
+                        const noteNumbers = new Set<number>()
+                        files.forEach(file => {
+                          // Match Note X.md, Note X.excalidraw.md (backward compat), or Note X.excalidraw
+                          // Check longer extensions first (.excalidraw.md before .excalidraw)
+                          const match = file.name.match(/^Note (\d+)\.(excalidraw\.md|excalidraw|md)$/)
+                          if (match) {
+                            noteNumbers.add(parseInt(match[1], 10))
+                          }
+                        })
+                        
+                        let nextNumber = 1
+                        while (noteNumbers.has(nextNumber)) {
+                          nextNumber++
+                        }
+                        return nextNumber
+                      }
+                      
+                      const noteNumber = getNextAvailableNoteNumber()
+                      const fileName = `Note ${noteNumber}`
+                      console.log('Sidebar: Creating Excalidraw file:', fileName)
+                      const result = await createNoteFile(fileName, 'excalidraw')
+                      console.log('Sidebar: Create result:', result)
+                      
+                      if (result.success && result.filePath) {
+                        // Wait a bit longer for file to be fully written
+                        await new Promise(resolve => setTimeout(resolve, 300))
+                        const newFile: FileItem = {
+                          name: result.filePath,
+                          path: result.filePath,
+                          modified: Date.now(),
+                          size: 0
+                        }
+                        setFiles(prevFiles => {
+                          const exists = prevFiles.some(f => f.path === result.filePath)
+                          if (exists) return prevFiles
+                          return [...prevFiles, newFile]
+                        })
+                        
+                        // Create note on canvas and open Excalidraw editor
+                        // Use the file path returned from createNoteFile (should be .excalidraw)
+                        const finalFilePath = result.filePath;
+                        console.log('Sidebar: Calling onCreateNoteOnCanvas with:', finalFilePath, 'excalidraw')
+                        if (onCreateNoteOnCanvas) {
+                          // Add a small delay to ensure file is readable
+                          await new Promise(resolve => setTimeout(resolve, 100))
+                          onCreateNoteOnCanvas(finalFilePath, 'excalidraw')
+                        } else {
+                          console.error('Sidebar: onCreateNoteOnCanvas is not defined!')
+                        }
+                      } else {
+                        console.error('Sidebar: Failed to create Excalidraw file:', result.error)
+                      }
+                    }}
+                    className="w-full px-4 py-2 text-left text-sm text-gray-700 hover:bg-gray-100 transition-colors flex items-center gap-2"
+                  >
+                    <svg className="w-4 h-4 text-purple-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15.232 5.232l3.536 3.536m-2.036-5.036a2.5 2.5 0 113.536 3.536L6.5 21.036H3v-3.572L16.732 3.732z" />
+                    </svg>
+                    Add Drawing
+                  </button>
+                </div>
+              )}
+            </div>
           </div>
           <div className="space-y-1 flex-1 overflow-y-auto">
             {files.length === 0 ? (
@@ -548,9 +802,23 @@ const Sidebar = forwardRef<SidebarHandle, SidebarProps>(({ onOpenFile, onFileRen
                 No files found
               </div>
             ) : (
-              files.map((file) => {
+              [...files].sort((a, b) => {
+                // Sort alphabetically by file name (case-insensitive)
+                const nameA = (a.name || '').toLowerCase();
+                const nameB = (b.name || '').toLowerCase();
+                return nameA.localeCompare(nameB);
+              }).map((file) => {
                 // Check if this file is being renamed
                 const isRenaming = renamingFile === file.path
+                
+                // Check if this file is on the canvas
+                const isOnCanvas = canvasNotes.some(note => {
+                  if (!note.filePath) return false
+                  // Normalize paths for comparison
+                  const noteFilePath = note.filePath.split('/').pop() || note.filePath
+                  const filePath = file.path.split('/').pop() || file.path
+                  return noteFilePath === filePath
+                })
                 
                 return (
                   <div key={`${file.path}-${file.name}`} className="relative">
@@ -609,13 +877,23 @@ const Sidebar = forwardRef<SidebarHandle, SidebarProps>(({ onOpenFile, onFileRen
                         handleFileDoubleClick(file)
                       }}
                       onContextMenu={(e) => handleFileContextMenu(e, file)}
-                      className="w-full flex items-center gap-2 px-3 py-2 rounded-lg text-left transition-colors text-gray-700 hover:bg-gray-50 cursor-move"
+                      className={`w-full flex items-center gap-2 px-3 py-2 rounded-lg text-left transition-colors cursor-move ${
+                        isOnCanvas 
+                          ? 'bg-gray-100 text-gray-900' 
+                          : 'text-gray-700 hover:bg-gray-50'
+                      }`}
                     >
-                      <svg className="w-4 h-4 text-gray-500 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
-                      </svg>
-                      <span className="text-sm truncate flex-1">
-                        {fileTitles.get(file.path) || (file.name.endsWith('.md') ? file.name.slice(0, -3) : file.name)}
+                      {(file.name.endsWith('.excalidraw.md') || file.name.endsWith('.excalidraw')) ? (
+                        <svg className="w-4 h-4 text-purple-500 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15.232 5.232l3.536 3.536m-2.036-5.036a2.5 2.5 0 113.536 3.536L6.5 21.036H3v-3.572L16.732 3.732z" />
+                        </svg>
+                      ) : (
+                        <svg className="w-4 h-4 text-gray-500 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
+                        </svg>
+                      )}
+                      <span className="text-sm flex-1 break-words">
+                        {fileTitles.get(file.path) || getTitleFromFilePath(file.name)}
                       </span>
                     </button>
                     )}
@@ -690,7 +968,9 @@ const Sidebar = forwardRef<SidebarHandle, SidebarProps>(({ onOpenFile, onFileRen
         </button>
       </div>
 
-      {/* File Context Menu */}
+      </div>
+
+      {/* File Context Menu - Outside content wrapper so it's always accessible */}
       {contextMenuFile && (
         <div
           ref={contextMenuRef}
@@ -729,7 +1009,7 @@ const Sidebar = forwardRef<SidebarHandle, SidebarProps>(({ onOpenFile, onFileRen
         </div>
       )}
 
-      {/* Warning Modal */}
+      {/* Warning Modal - Outside content wrapper so it's always accessible */}
       {warningMessage && (
         <WarningModal
           message={warningMessage}

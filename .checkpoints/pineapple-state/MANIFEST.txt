@@ -1,0 +1,24 @@
+Pineapple State Checkpoint - File Manifest
+============================================
+
+Core Components:
+- MegaSurface.tsx (Main canvas component with stable coordinates)
+- App.tsx (Main application component)
+- HoverEditor.tsx (Note editor with backlinks)
+- Sidebar.tsx (File browser and canvas list)
+- HeaderBar.tsx (Top navigation)
+
+Utilities:
+- coords.ts (Coordinate conversion - screen to world)
+- storage.ts (Canvas state persistence)
+- fileSystem.ts (File operations)
+
+Styles:
+- index.css (Global styles including link hover effects)
+
+This checkpoint was created after:
+- Removing group creation functionality
+- Restoring normal note click behavior
+- All core features working (canvas cards, links, arrows, etc.)
+
+

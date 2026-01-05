@@ -1,4 +1,4 @@
-# Mindz - Infinite Canvas Note-Taking App
+# Axiom - Infinite Canvas Note-Taking App
 
 A modern, offline-first note-taking application with an infinite canvas interface, inspired by Scrintal and Heptabase.
 
@@ -56,7 +56,7 @@ The built files will be in the `dist` directory.
 ## Project Structure
 
 ```
-mindz/
+axiom/
 ├── src/
 │   ├── components/
 │   │   ├── HeaderBar.tsx    # Top navigation bar

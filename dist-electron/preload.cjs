@@ -1,13 +1,16 @@
 const { contextBridge, ipcRenderer } = require('electron');
+// Log preload script execution for debugging
+console.log('[PRELOAD] Preload script loading...');
 // Expose protected methods that allow the renderer process to use
 // the ipcRenderer without exposing the entire object
+console.log('[PRELOAD] Exposing electronAPI to window...');
 contextBridge.exposeInMainWorld('electronAPI', {
     // File operations
     saveNoteFile: (filePath, content) => ipcRenderer.invoke('save-note-file', filePath, content),
     loadNoteFile: (filePath) => ipcRenderer.invoke('load-note-file', filePath),
     deleteNoteFile: (filePath) => ipcRenderer.invoke('delete-note-file', filePath),
     renameNoteFile: (oldFilePath, newFileName) => ipcRenderer.invoke('rename-note-file', oldFilePath, newFileName),
-    createNoteFile: (fileName) => ipcRenderer.invoke('create-note-file', fileName),
+    createNoteFile: (fileName, noteType) => ipcRenderer.invoke('create-note-file', fileName, noteType || 'markdown'),
     saveImageFile: (fileName, imageData) => ipcRenderer.invoke('save-image-file', fileName, imageData),
     listNoteFiles: () => ipcRenderer.invoke('list-note-files'),
     saveFileDialog: () => ipcRenderer.invoke('save-file-dialog'),
@@ -27,3 +30,4 @@ contextBridge.exposeInMainWorld('electronAPI', {
     selectVaultFolder: () => ipcRenderer.invoke('select-vault-folder'),
     getVaultPath: () => ipcRenderer.invoke('get-vault-path'),
 });
+console.log('[PRELOAD] electronAPI exposed successfully');

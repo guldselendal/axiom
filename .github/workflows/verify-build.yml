@@ -1,0 +1,75 @@
+name: Verify Build Integrity
+
+on:
+  pull_request:
+    paths:
+      - 'src/**'
+      - 'electron/**'
+      - 'vite.config.*'
+      - 'package.json'
+      - 'index.html'
+  push:
+    branches:
+      - main
+      - master
+
+jobs:
+  verify-build:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+      
+      - name: Install dependencies
+        run: npm ci
+      
+      - name: Validate HTML template
+        run: npm run prebuild
+      
+      - name: Build application
+        run: npm run build
+      
+      - name: Verify packaged assets
+        run: node scripts/verify-packaged-assets.cjs
+      
+      - name: Build Electron main process
+        run: npm run electron:build-main
+      
+      - name: Verify dist structure
+        run: |
+          if [ ! -f "dist/renderer/index.html" ]; then
+            echo "❌ ERROR: dist/renderer/index.html not found"
+            exit 1
+          fi
+          if [ ! -d "dist/renderer/assets" ]; then
+            echo "❌ ERROR: dist/renderer/assets directory not found"
+            exit 1
+          fi
+          echo "✅ dist/renderer structure verified"
+      
+      - name: Guard HTML integrity
+        run: node scripts/guard-html-integrity.cjs
+      
+      - name: Verify Vite base configuration
+        run: |
+          if ! grep -q 'base:.*"./".*' vite.config.ts; then
+            echo "❌ ERROR: vite.config.ts must have base: './' for Electron file:// protocol"
+            exit 1
+          fi
+          echo "✅ Vite base configuration verified"
+      
+      - name: Verify packaging config includes dist/renderer
+        run: |
+          if ! grep -q '"dist/renderer/\*\*/\*"' package.json; then
+            echo "❌ ERROR: package.json build.files must include 'dist/renderer/**/*'"
+            exit 1
+          fi
+          echo "✅ Packaging configuration verified"
+

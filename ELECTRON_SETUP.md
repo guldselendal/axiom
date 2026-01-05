@@ -1,4 +1,4 @@
-# Electron Setup Guide for Mindz
+# Electron Setup Guide for Axiom
 
 ## Overview
 
@@ -35,9 +35,9 @@ npm run electron:build
 ## File Storage
 
 Files are stored in:
-- **macOS**: `~/Library/Application Support/mindz/mindz-data/`
-- **Windows**: `%APPDATA%/mindz/mindz-data/`
-- **Linux**: `~/.config/mindz/mindz-data/`
+- **macOS**: `~/Library/Application Support/axiom/axiom-data/`
+- **Windows**: `%APPDATA%/axiom/axiom-data/`
+- **Linux**: `~/.config/axiom/axiom-data/`
 
 ## Excalidraw Integration
 

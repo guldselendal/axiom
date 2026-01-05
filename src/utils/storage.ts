@@ -21,6 +21,11 @@ interface AppState {
 
 let appStateCache: AppState | null = null
 
+// Clear state cache (useful when switching vaults)
+export const clearStateCache = () => {
+  appStateCache = null
+}
+
 // Load app state cache on module load
 const loadStateCache = async (): Promise<AppState> => {
   checkElectronAPI()
@@ -29,6 +34,7 @@ const loadStateCache = async (): Promise<AppState> => {
     if (result.success && result.state) {
       appStateCache = result.state as AppState
     } else {
+      // No state file exists - start with empty vault
       appStateCache = { canvases: {}, canvasList: ['My Desk'], currentCanvas: 'My Desk' }
     }
     // Ensure structure exists
@@ -54,7 +60,7 @@ const debouncedSave = () => {
   saveTimeout = setTimeout(async () => {
     checkElectronAPI()
     if (appStateCache) {
-      await window.electronAPI!.saveAppState(appStateCache)
+      await window.electronAPI!.saveAppState(appStateCache as any)
     }
   }, 500) // Debounce by 500ms
 }
@@ -67,7 +73,7 @@ export const forceSave = async () => {
   }
   checkElectronAPI()
   if (appStateCache) {
-    await window.electronAPI!.saveAppState(appStateCache)
+    await window.electronAPI!.saveAppState(appStateCache as any)
   }
 }
 
@@ -94,7 +100,12 @@ export const saveNotes = async (notes: Note[], canvasId: string) => {
 export const loadNotes = async (canvasId: string): Promise<Note[] | null> => {
   try {
     const canvasState = await getCanvasState(canvasId)
-    return canvasState.notes || null
+    // Return null if notes don't exist or is empty array (new canvas)
+    // Only return notes if they actually exist and have content
+    if (canvasState.notes && Array.isArray(canvasState.notes) && canvasState.notes.length > 0) {
+      return canvasState.notes
+    }
+    return null
   } catch (error) {
     console.error('Failed to load notes:', error)
     return null
@@ -186,6 +197,56 @@ export const loadCurrentCanvas = async (): Promise<string> => {
   }
 }
 
+export const deleteCanvas = async (canvasId: string): Promise<{ success: boolean; error?: string }> => {
+  try {
+    const state = await loadStateCache()
+    
+    // Don't allow deleting "My Desk"
+    if (canvasId === 'My Desk') {
+      return { success: false, error: 'Cannot delete "My Desk" canvas' }
+    }
+    
+    // Remove canvas from list
+    if (state.canvasList) {
+      state.canvasList = state.canvasList.filter(id => id !== canvasId)
+    }
+    
+    // Remove canvas state
+    if (state.canvases && state.canvases[canvasId]) {
+      delete state.canvases[canvasId]
+    }
+    
+    // If deleted canvas was current, switch to "My Desk"
+    if (state.currentCanvas === canvasId) {
+      state.currentCanvas = 'My Desk'
+    }
+    
+    appStateCache = state
+    // Force immediate save to ensure deletion is persisted
+    await forceSave()
+    
+    return { success: true }
+  } catch (error) {
+    console.error('Failed to delete canvas:', error)
+    return { success: false, error: String(error) }
+  }
+}
+
+// Clear canvas state (useful when recreating a canvas with the same name)
+export const clearCanvasState = async (canvasId: string): Promise<void> => {
+  try {
+    const state = await loadStateCache()
+    if (state.canvases && state.canvases[canvasId]) {
+      // Clear all state for this canvas
+      state.canvases[canvasId] = {}
+      appStateCache = state
+      debouncedSave()
+    }
+  } catch (error) {
+    console.error('Failed to clear canvas state:', error)
+  }
+}
+
 // Remove notes with matching filePath from all canvases
 export const removeNoteFromAllCanvases = async (filePath: string): Promise<void> => {
   try {
@@ -234,10 +295,72 @@ export const removeNoteFromAllCanvases = async (filePath: string): Promise<void>
     // Force immediate save (don't debounce for deletions)
     checkElectronAPI()
     if (appStateCache) {
-      await window.electronAPI!.saveAppState(appStateCache)
+      await window.electronAPI!.saveAppState(appStateCache as any)
     }
   } catch (error) {
     console.error('Failed to remove note from all canvases:', error)
+  }
+}
+
+// Get all canvases that contain a note with the given filePath
+export const getCanvasesForNote = async (filePath: string): Promise<string[]> => {
+  try {
+    if (!filePath) {
+      return []
+    }
+    
+    // Check if Electron API is available before proceeding
+    if (!window.electronAPI) {
+      console.warn('Electron API not available, returning empty canvas list')
+      return []
+    }
+    
+    const state = await loadStateCache()
+    
+    // Normalize filePath - extract just the filename (e.g., "Note 1.md")
+    let normalizedFilePath = filePath
+    if (normalizedFilePath.includes('/')) {
+      normalizedFilePath = normalizedFilePath.split('/').pop() || normalizedFilePath
+    }
+    if (normalizedFilePath.startsWith('/')) {
+      normalizedFilePath = normalizedFilePath.slice(1)
+    }
+    
+    const canvasesWithNote: string[] = []
+    
+    if (state.canvases) {
+      for (const canvasId in state.canvases) {
+        const canvasState = state.canvases[canvasId]
+        if (canvasState.notes && Array.isArray(canvasState.notes)) {
+          try {
+            const hasNote = canvasState.notes.some(note => {
+              // Safely access filePath - handle both old and new note formats
+              const noteFilePath = (note as any).filePath || ''
+              if (!noteFilePath) {
+                return false
+              }
+              // Match by filePath (normalized)
+              const noteNormalized = noteFilePath.includes('/') 
+                ? noteFilePath.split('/').pop() || noteFilePath
+                : noteFilePath
+              return noteNormalized === normalizedFilePath
+            })
+            if (hasNote) {
+              canvasesWithNote.push(canvasId)
+            }
+          } catch (error) {
+            // Skip this canvas if there's an error processing notes
+            console.error(`Error processing notes for canvas ${canvasId}:`, error)
+            continue
+          }
+        }
+      }
+    }
+    
+    return canvasesWithNote
+  } catch (error) {
+    console.error('Failed to get canvases for note:', error)
+    return []
   }
 }
 

@@ -69,9 +69,9 @@ npm run electron:dev
 
 ## File Storage Locations
 
-- **macOS**: `~/Library/Application Support/mindz/mindz-data/`
-- **Windows**: `%APPDATA%/mindz/mindz-data/`
-- **Linux**: `~/.config/mindz/mindz-data/`
+- **macOS**: `~/Library/Application Support/axiom/axiom-data/`
+- **Windows**: `%APPDATA%/axiom/axiom-data/`
+- **Linux**: `~/.config/axiom/axiom-data/`
 
 ## Architecture Benefits
 

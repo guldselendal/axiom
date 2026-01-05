@@ -1,7 +1,8 @@
-import React, { useState, useEffect, useRef, useCallback, useImperativeHandle, forwardRef } from 'react'
-import { saveImageFile, getVaultPath, listNoteFiles, createNoteFile } from '../utils/fileSystem'
+import React, { useState, useEffect, useRef, useCallback, useImperativeHandle, forwardRef, useMemo } from 'react'
+import { getVaultPath, listNoteFiles, createNoteFile, loadNoteFromFile } from '../utils/fileSystem'
 import { findImages, getImageUrl } from '../utils/imageParser'
-import { findLinks } from '../utils/linkParser'
+import { findLinks, stripFileExtension } from '../utils/linkParser'
+import { getCanvasesForNote } from '../utils/storage'
 
 interface Note {
   id: string
@@ -26,12 +27,25 @@ interface HoverEditorProps {
   onLinkClick?: (fileName: string) => void
   onDelete?: (note: Note) => void
   onFileCreated?: (filePath: string) => void
+  allNotes?: Array<{ content: string; filePath?: string; title?: string; id: string }> // All notes to find backlinks
+  onPositionChange?: (position: { x: number; y: number }) => void // Callback when position changes (e.g., after drag)
+  canvases?: string[] // List of all available canvases for linking
+  onCanvasChange?: (canvasName: string) => void // Callback to navigate to a canvas
 }
 
 const HoverEditor = forwardRef<HoverEditorHandle, HoverEditorProps>((props, ref) => {
-  const { note, position, filePath, onSave, onClose, onLinkClick, onDelete, onFileCreated } = props
+  const { note, position, filePath, onSave, onClose, onLinkClick, onDelete, onFileCreated, allNotes = [], onPositionChange, canvases = [], onCanvasChange } = props
+  
+  // Safety checks for note object
+  if (!note || typeof note !== 'object') {
+    console.error('HoverEditor: Invalid note object', note)
+    return null
+  }
+  
   // Split note content into title and body
-  const lines = note.content.split('\n')
+  // Safety check: ensure content exists (for Markdown notes)
+  const noteContent = (note as any)?.content || ''
+  const lines = (noteContent || '').split('\n')
   const initialTitle = lines[0] || ''
   const initialBody = lines.slice(1).join('\n')
   
@@ -52,11 +66,27 @@ const HoverEditor = forwardRef<HoverEditorHandle, HoverEditorProps>((props, ref)
   const [isEditingFileName, setIsEditingFileName] = useState(false)
   const [editorPosition, setEditorPosition] = useState(position)
   const [isDragging, setIsDragging] = useState(false)
-  const [dragStart, setDragStart] = useState({ x: 0, y: 0 })
-  const [renderedBody, setRenderedBody] = useState('')
+  const dragStartRef = useRef({ x: 0, y: 0, startX: 0, startY: 0 })
+  
+  // Track if position has been manually set (via drag)
+  const hasManualPositionRef = useRef(false)
+  
+  // Reset manual position flag when note changes
+  useEffect(() => {
+    hasManualPositionRef.current = false
+    setEditorPosition(position)
+  }, [note.id])
+  
+  // Update editor position when position prop changes (but not while dragging or if manually positioned)
+  useEffect(() => {
+    if (!isDragging && !hasManualPositionRef.current) {
+      setEditorPosition(position)
+    }
+  }, [position, isDragging])
   const [vaultPath, setVaultPath] = useState<string>('')
   const [existingFiles, setExistingFiles] = useState<Set<string>>(new Set())
   const [allFiles, setAllFiles] = useState<string[]>([])
+  const [noteCanvases, setNoteCanvases] = useState<string[]>([])
   const editorRef = useRef<HTMLDivElement>(null)
   const titleInputRef = useRef<HTMLInputElement>(null)
   const fileNameInputRef = useRef<HTMLInputElement>(null)
@@ -248,6 +278,44 @@ const HoverEditor = forwardRef<HoverEditorHandle, HoverEditorProps>((props, ref)
     loadVaultPath()
   }, [])
 
+  // Load canvases that contain this note
+  useEffect(() => {
+    // Initialize with empty array immediately
+    setNoteCanvases([])
+    
+    // Only load if filePath exists
+    if (!filePath) {
+      return
+    }
+    
+    let isMounted = true
+    
+    const loadNoteCanvases = async () => {
+      try {
+        const canvases = await getCanvasesForNote(filePath)
+        if (isMounted && Array.isArray(canvases)) {
+          setNoteCanvases(canvases)
+        }
+      } catch (error) {
+        console.error('Error loading note canvases:', error)
+        if (isMounted) {
+          setNoteCanvases([])
+        }
+      }
+    }
+    
+    // Use setTimeout to defer execution and prevent blocking render
+    const timeoutId = setTimeout(() => {
+      loadNoteCanvases()
+    }, 100) // Increased delay to ensure component is fully mounted
+    
+    return () => {
+      isMounted = false
+      clearTimeout(timeoutId)
+    }
+  }, [filePath])
+
+
   // Initial render of body content with styled links (no buttons)
   useEffect(() => {
     if (contentEditableRef.current && !vaultPath) {
@@ -272,11 +340,13 @@ const HoverEditor = forwardRef<HoverEditorHandle, HoverEditorProps>((props, ref)
           html += textBefore.replace(/\n/g, '<br>')
         }
         
-        // Check if file exists to determine opacity
-        const fileExists = existingFiles.has(link.fileName)
+        // Check if file exists or if it's a canvas (canvases always exist)
+        const isCanvas = canvases.includes(link.fileName)
+        const fileExists = existingFiles.has(link.fileName) || isCanvas
         const opacity = fileExists ? '1' : '0.5'
         // Check if link has display text (format: [[fileName|displayText]])
-        const displayText = link.displayText || link.fileName
+        // If no explicit display text, strip file extension for cleaner display
+        const displayText = link.displayText || stripFileExtension(link.fileName)
         // Add styled link span with contenteditable="false" to prevent editing inside
         html += `<span class="note-link-text" contenteditable="false" data-file-name="${link.fileName.replace(/"/g, '&quot;')}" style="color: rgb(99, 102, 241); font-weight: 500; cursor: pointer; opacity: ${opacity};">${displayText}</span>`
         
@@ -299,7 +369,7 @@ const HoverEditor = forwardRef<HoverEditorHandle, HoverEditorProps>((props, ref)
         isUpdatingFromMarkdown.current = false
       }
     }
-  }, [body, vaultPath, existingFiles])
+  }, [body, vaultPath, existingFiles, canvases])
 
   // Render body with images and styled links (spans, not buttons)
   useEffect(() => {
@@ -318,9 +388,13 @@ const HoverEditor = forwardRef<HoverEditorHandle, HoverEditorProps>((props, ref)
       const links = findLinks(body)
       
       // Combine and sort by position
-      const allElements = [
-        ...images.map(img => ({ type: 'image' as const, ...img })),
-        ...links.map(link => ({ type: 'link' as const, ...link }))
+      type Element = 
+        | ({ type: 'image' } & { startIndex: number; endIndex: number; path: string; alt?: string })
+        | ({ type: 'link' } & { startIndex: number; endIndex: number; fileName: string })
+      
+      const allElements: Element[] = [
+        ...images.map(img => ({ type: 'image' as const, startIndex: img.startIndex, endIndex: img.endIndex, path: img.path, alt: img.alt })),
+        ...links.map(link => ({ type: 'link' as const, startIndex: link.startIndex, endIndex: link.endIndex, fileName: link.fileName }))
       ].sort((a, b) => a.startIndex - b.startIndex)
       
       if (allElements.length === 0) {
@@ -376,16 +450,17 @@ const HoverEditor = forwardRef<HoverEditorHandle, HoverEditorProps>((props, ref)
         if (element.type === 'image') {
           // Get image URL
           const imageUrl = await getImageUrl(element.path, vaultPath || undefined)
-          const altText = element.alt || element.path.split('/').pop()?.split('\\').pop() || 'Image'
+          const altText = (element.alt || element.path.split('/').pop()?.split('\\').pop() || 'Image')
           
           // Create img tag
           html += `<img src="${imageUrl}" alt="${altText}" style="max-width: 100%; height: auto; max-height: 300px; object-fit: contain; border-radius: 4px; margin: 8px 0; display: block;" />`
         } else if (element.type === 'link') {
           // Create styled link span with contenteditable="false" to prevent editing inside
           const fileName = element.fileName
-          const displayText = element.displayText || fileName
-          // Check if file exists to determine opacity
-          const fileExists = existingFiles.has(fileName)
+          const displayText = stripFileExtension(fileName)
+          // Check if file exists or if it's a canvas (canvases always exist)
+          const isCanvas = canvases.includes(fileName)
+          const fileExists = existingFiles.has(fileName) || isCanvas
           const opacity = fileExists ? '1' : '0.5'
           html += `<span class="note-link-text" contenteditable="false" data-file-name="${fileName.replace(/"/g, '&quot;')}" style="color: rgb(99, 102, 241); font-weight: 500; cursor: pointer; opacity: ${opacity};">${displayText}</span>`
         }
@@ -410,7 +485,7 @@ const HoverEditor = forwardRef<HoverEditorHandle, HoverEditorProps>((props, ref)
     if (vaultPath) {
       renderBodyWithImagesAndLinks()
     }
-  }, [body, vaultPath, existingFiles])
+  }, [body, vaultPath, existingFiles, canvases])
 
   // Focus rename input when editing starts
   useEffect(() => {
@@ -424,41 +499,54 @@ const HoverEditor = forwardRef<HoverEditorHandle, HoverEditorProps>((props, ref)
 
   // Handle dragging
   useEffect(() => {
-    const handleMouseMove = (e: MouseEvent) => {
+    const handleMove = (e: MouseEvent | PointerEvent) => {
       if (isDragging) {
-        const deltaX = e.clientX - dragStart.x
-        const deltaY = e.clientY - dragStart.y
-        setEditorPosition({
-          x: position.x + deltaX,
-          y: position.y + deltaY,
-        })
+        const deltaX = e.clientX - dragStartRef.current.x
+        const deltaY = e.clientY - dragStartRef.current.y
+        const newPosition = {
+          x: dragStartRef.current.startX + deltaX,
+          y: dragStartRef.current.startY + deltaY,
+        }
+        setEditorPosition(newPosition)
+        // Notify parent of position change during drag (for real-time updates)
+        if (onPositionChange) {
+          onPositionChange(newPosition)
+        }
       }
     }
 
-    const handleMouseUp = () => {
+    const handleUp = () => {
       if (isDragging) {
         setIsDragging(false)
+        // Mark position as manually set
+        hasManualPositionRef.current = true
       }
     }
 
     if (isDragging) {
-      window.addEventListener('mousemove', handleMouseMove)
-      window.addEventListener('mouseup', handleMouseUp)
+      window.addEventListener('mousemove', handleMove)
+      window.addEventListener('mouseup', handleUp)
+      window.addEventListener('pointermove', handleMove)
+      window.addEventListener('pointerup', handleUp)
       return () => {
-        window.removeEventListener('mousemove', handleMouseMove)
-        window.removeEventListener('mouseup', handleMouseUp)
+        window.removeEventListener('mousemove', handleMove)
+        window.removeEventListener('mouseup', handleUp)
+        window.removeEventListener('pointermove', handleMove)
+        window.removeEventListener('pointerup', handleUp)
       }
     }
-  }, [isDragging, dragStart, position])
+  }, [isDragging])
 
   const handleHeaderMouseDown = (e: React.MouseEvent) => {
     // Only start dragging if clicking on the header, not on buttons
     if (e.target === headerRef.current || (e.target as HTMLElement).closest('.header-drag-area')) {
-      setIsDragging(true)
-      setDragStart({
+      dragStartRef.current = {
         x: e.clientX,
         y: e.clientY,
-      })
+        startX: editorPosition.x,
+        startY: editorPosition.y,
+      }
+      setIsDragging(true)
       e.preventDefault()
     }
   }
@@ -468,7 +556,7 @@ const HoverEditor = forwardRef<HoverEditorHandle, HoverEditorProps>((props, ref)
 
   // Calculate editor position (smart positioning near the note, or use dragged position)
   const editorWidth = 420
-  const editorHeight = 320
+  const editorHeight = 500 // Fixed height - short side is width
   const padding = 20
   
   // Use dragged position if available, otherwise calculate initial position
@@ -505,6 +593,94 @@ const HoverEditor = forwardRef<HoverEditorHandle, HoverEditorProps>((props, ref)
   const [availableFiles, setAvailableFiles] = useState<string[]>([])
   const originalPositionRef = useRef(position)
   const originalSizeRef = useRef({ width: editorWidth, height: editorHeight })
+  const [showBacklinks, setShowBacklinks] = useState(false)
+  const [allVaultNotes, setAllVaultNotes] = useState<Array<{ content: string; filePath?: string; title?: string; id: string }>>([])
+  
+  // Load all notes from vault for backlink calculation
+  useEffect(() => {
+    const loadAllNotes = async () => {
+      if (!filePath) return
+      
+      try {
+        const filesResult = await listNoteFiles()
+        if (filesResult.success && filesResult.files) {
+          const loadedNotes: Array<{ content: string; filePath?: string; title?: string; id: string }> = []
+          
+          // Load content for all files
+          await Promise.all(filesResult.files.map(async (file: any) => {
+            const filePath = file.path || file.name || file
+            try {
+              const loadResult = await loadNoteFromFile(filePath)
+              if (loadResult.success && loadResult.content !== undefined) {
+                const content = loadResult.content || ''
+                const lines = content.split('\n')
+                const title = (lines[0] || '').trim() || (filePath.split('/').pop() || filePath).replace('.md', '')
+                loadedNotes.push({
+                  id: filePath, // Use filePath as ID for vault notes
+                  content,
+                  title,
+                  filePath,
+                })
+              }
+            } catch (error) {
+              console.error(`Error loading file ${filePath}:`, error)
+            }
+          }))
+          
+          setAllVaultNotes(loadedNotes)
+        }
+      } catch (error) {
+        console.error('Error loading all notes for backlinks:', error)
+      }
+    }
+    
+    loadAllNotes()
+  }, [filePath])
+  
+  // Calculate backlinks - notes that link to this note
+  const backlinks = useMemo(() => {
+    if (!filePath) return []
+    
+    // Get current note's filename (without extension) for comparison
+    const currentFileName = filePath.split('/').pop() || filePath
+    const normalizedCurrentFileName = currentFileName.endsWith('.md') 
+      ? currentFileName.slice(0, -3) 
+      : currentFileName
+    
+    const backlinkNotes: Array<{ id: string; title: string; filePath?: string }> = []
+    
+    // Combine canvas notes and vault notes, prioritizing canvas notes
+    const notesToCheck = [...allNotes, ...allVaultNotes.filter(vaultNote => 
+      !allNotes.some(canvasNote => canvasNote.filePath === vaultNote.filePath)
+    )]
+    
+    notesToCheck.forEach(otherNote => {
+      // Skip self
+      if (otherNote.filePath === filePath || otherNote.id === note.id) return
+      
+      // Check if this note links to the current note
+      if (otherNote.content) {
+        const links = findLinks(otherNote.content)
+        const linksToCurrent = links.some(link => {
+          const linkFileName = link.fileName.trim()
+          const normalizedLinkFileName = linkFileName.endsWith('.md')
+            ? linkFileName.slice(0, -3)
+            : linkFileName
+          return normalizedLinkFileName === normalizedCurrentFileName
+        })
+        
+        if (linksToCurrent) {
+          backlinkNotes.push({
+            id: otherNote.id,
+            title: otherNote.title || (otherNote.content.split('\n')[0] || '').trim() || 'Untitled',
+            filePath: otherNote.filePath,
+          })
+        }
+      }
+    })
+    
+    return backlinkNotes
+  }, [filePath, allNotes, allVaultNotes, note.id])
 
   // Store original position and size on mount
   useEffect(() => {
@@ -513,7 +689,7 @@ const HoverEditor = forwardRef<HoverEditorHandle, HoverEditorProps>((props, ref)
   }, [])
 
   // Handle image paste (extracted to reusable function)
-  const handleImagePaste = useCallback(async (imageData: string, mimeType: string) => {
+  const handleImagePaste = useCallback(async (imageData: string, _mimeType: string) => {
     if (!contentEditableRef.current) return
 
     // Create img element
@@ -795,7 +971,7 @@ const HoverEditor = forwardRef<HoverEditorHandle, HoverEditorProps>((props, ref)
               const fileExists = existingFiles.has(link.fileName)
               const opacity = fileExists ? '1' : '0.5'
               // Check if link has display text
-              const displayText = link.displayText || link.fileName
+              const displayText = link.displayText || stripFileExtension(link.fileName)
               // Add styled link span
               newHtml += `<span class="note-link-text" contenteditable="false" data-file-name="${link.fileName.replace(/"/g, '&quot;')}" style="color: rgb(99, 102, 241); font-weight: 500; cursor: pointer; opacity: ${opacity};">${displayText}</span>`
               
@@ -919,9 +1095,12 @@ const HoverEditor = forwardRef<HoverEditorHandle, HoverEditorProps>((props, ref)
     setLinkDropdownPos({ x: rect.left, y: rect.top + rect.height + 5 })
     setLinkSearchText('')
     setLinkDropdownIndex(0)
-    setAvailableFiles(allFiles)
+    // Combine files and canvases, excluding "My Desk"
+    const filteredCanvases = canvases.filter(canvas => canvas !== 'My Desk')
+    const combined = [...allFiles, ...filteredCanvases]
+    setAvailableFiles(combined)
     setShowLinkDropdown(true)
-  }, [allFiles])
+  }, [allFiles, canvases])
 
   // Check for [[ pattern and show dropdown
   const checkForLinkDropdown = useCallback(() => {
@@ -945,20 +1124,27 @@ const HoverEditor = forwardRef<HoverEditorHandle, HoverEditorProps>((props, ref)
       setLinkDropdownPos({ x: rect.left, y: rect.top + rect.height + 5 })
       setLinkSearchText('')
       setLinkDropdownIndex(0)
-      setAvailableFiles(allFiles)
+      // Combine files and canvases, excluding "My Desk"
+      const filteredCanvases = canvases.filter(canvas => canvas !== 'My Desk')
+      const combined = [...allFiles, ...filteredCanvases]
+      setAvailableFiles(combined)
       setShowLinkDropdown(true)
     } else if (text.match(/\[\[([^\]]*)$/)) {
-      // User is typing after [[ - filter files
+      // User is typing after [[ - filter files and canvases
       const match = text.match(/\[\[([^\]]*)$/)
       if (match) {
         const searchText = match[1]
         setLinkSearchText(searchText)
         const searchTextLower = searchText.toLowerCase()
         
-        // Filter files that start with the search text (case-insensitive)
-        const filtered = allFiles.filter(file => 
+        // Filter files and canvases that start with the search text (case-insensitive), excluding "My Desk"
+        const filteredFiles = allFiles.filter(file => 
           file.toLowerCase().startsWith(searchTextLower)
         )
+        const filteredCanvases = canvases.filter(canvas => 
+          canvas !== 'My Desk' && canvas.toLowerCase().startsWith(searchTextLower)
+        )
+        const filtered = [...filteredFiles, ...filteredCanvases]
         
         setAvailableFiles(filtered)
         setLinkDropdownIndex(0)
@@ -967,7 +1153,7 @@ const HoverEditor = forwardRef<HoverEditorHandle, HoverEditorProps>((props, ref)
     } else {
       setShowLinkDropdown(false)
     }
-  }, [allFiles])
+  }, [allFiles, canvases])
 
   // Insert selected file name into [[...]]
   const insertLinkFileName = useCallback((fileName: string) => {
@@ -1053,9 +1239,6 @@ const HoverEditor = forwardRef<HoverEditorHandle, HoverEditorProps>((props, ref)
       return
     }
 
-    // Calculate how many characters after [[ need to be replaced
-    const textAfterBrackets = text.substring(bracketPos + 2)
-    
     // Create a range that starts right after [[ and ends at the current cursor
     const replaceRange = range.cloneRange()
     
@@ -1100,8 +1283,10 @@ const HoverEditor = forwardRef<HoverEditorHandle, HoverEditorProps>((props, ref)
     // Move cursor to after the inserted file name and closing brackets
     replaceRange.setStartAfter(textNode)
     replaceRange.collapse(true)
-    selection.removeAllRanges()
-    selection.addRange(replaceRange)
+    if (selection) {
+      selection.removeAllRanges()
+      selection.addRange(replaceRange)
+    }
 
     // Hide dropdown
     setShowLinkDropdown(false)
@@ -1196,7 +1381,7 @@ const HoverEditor = forwardRef<HoverEditorHandle, HoverEditorProps>((props, ref)
     : editorWidth
   const finalEditorHeight = isFullscreen 
     ? window.innerHeight - (headerBarHeight + 20) 
-    : editorHeight // Keep original height when not fullscreen
+    : editorHeight // Fixed height - rectangle with width as short side
   let finalScreenX = screenX
   let finalScreenY = screenY
   if (isFullscreen) {
@@ -1208,23 +1393,38 @@ const HoverEditor = forwardRef<HoverEditorHandle, HoverEditorProps>((props, ref)
   return (
     <div
       ref={editorRef}
-      className={`fixed bg-white shadow-2xl border border-gray-200 flex flex-col ${isFullscreen ? 'z-[99999]' : 'z-[9999]'}`}
+      className={`fixed bg-white shadow-md border border-gray-200 flex flex-col ${isFullscreen ? 'z-[99999]' : 'z-[9999]'}`}
       style={{
         left: `${finalScreenX}px`,
         top: `${finalScreenY}px`,
         width: `${finalEditorWidth}px`,
-        minHeight: `${finalEditorHeight}px`,
-        maxHeight: isFullscreen ? `calc(100vh - ${headerBarHeight + 20}px)` : '70vh',
-        borderRadius: isFullscreen ? '8px' : '8px',
+        height: `${finalEditorHeight}px`,
+        borderRadius: '8px',
+        boxShadow: '0 1px 3px 0 rgba(0, 0, 0, 0.1), 0 1px 2px 0 rgba(0, 0, 0, 0.06)',
       }}
       onClick={(e) => e.stopPropagation()}
       onMouseDown={(e) => e.stopPropagation()}
+      onPointerDown={(e) => e.stopPropagation()}
     >
       {/* Header */}
       <div 
         ref={headerRef}
-        className="flex items-center justify-between px-4 py-3 border-b border-gray-200 bg-white header-drag-area"
+        className="flex items-center justify-between px-5 py-3 border-b border-gray-100 bg-white header-drag-area"
         onMouseDown={handleHeaderMouseDown}
+        onPointerDown={(e) => {
+          e.stopPropagation();
+          // Only start dragging if clicking on the header, not on buttons
+          if (e.target === headerRef.current || (e.target as HTMLElement).closest('.header-drag-area')) {
+            dragStartRef.current = {
+              x: e.clientX,
+              y: e.clientY,
+              startX: editorPosition.x,
+              startY: editorPosition.y,
+            }
+            setIsDragging(true)
+            e.preventDefault()
+          }
+        }}
         style={{ cursor: isDragging ? 'grabbing' : 'grab' }}
       >
         {/* Title Input - moved to header */}
@@ -1318,25 +1518,26 @@ const HoverEditor = forwardRef<HoverEditorHandle, HoverEditorProps>((props, ref)
               originalTitleRef.current = newTitle
               onSave(combinedContent)
             }}
-            className="w-full font-bold text-gray-900 bg-transparent border-none outline-none placeholder:text-gray-400 truncate"
+            className="w-full font-semibold text-gray-900 bg-transparent border-none outline-none placeholder:text-gray-400 truncate"
             placeholder={getFileName(filePath) || "Note title..."}
-            style={{ fontFamily: 'system-ui, -apple-system, sans-serif', fontSize: '22px' }}
+            style={{ fontFamily: 'system-ui, -apple-system, sans-serif', fontSize: '18px', fontWeight: 500 }}
             onClick={(e) => e.stopPropagation()}
             onMouseDown={(e) => e.stopPropagation()}
           />
         </div>
         
         {/* Right side - Control buttons */}
-        <div className="flex items-center gap-1 flex-shrink-0">
+        <div className="flex items-center gap-0.5 flex-shrink-0">
           {/* Three dots menu */}
           <button
             onClick={(e) => {
               e.stopPropagation()
               setShowMenu(!showMenu)
             }}
-            className="p-1.5 hover:bg-gray-100 rounded transition-colors"
+            className="p-1.5 hover:bg-gray-50 rounded transition-colors opacity-60 hover:opacity-100"
             title="More options"
             onMouseDown={(e) => e.stopPropagation()}
+            onPointerDown={(e) => e.stopPropagation()}
           >
             <svg className="w-4 h-4 text-gray-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
               <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 5v.01M12 12v.01M12 19v.01M12 6a1 1 0 110-2 1 1 0 010 2zm0 7a1 1 0 110-2 1 1 0 010 2zm0 7a1 1 0 110-2 1 1 0 010 2z" />
@@ -1350,9 +1551,10 @@ const HoverEditor = forwardRef<HoverEditorHandle, HoverEditorProps>((props, ref)
                 e.stopPropagation()
                 setIsFullscreen(true)
               }}
-              className="p-1.5 hover:bg-gray-100 rounded transition-colors"
+              className="p-1.5 hover:bg-gray-50 rounded transition-colors opacity-60 hover:opacity-100"
               title="Fullscreen"
               onMouseDown={(e) => e.stopPropagation()}
+              onPointerDown={(e) => e.stopPropagation()}
             >
               <svg className="w-4 h-4 text-gray-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                 <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 8V4m0 0h4M4 4l5 5m11-1V4m0 0h-4m4 0l-5 5M4 16v4m0 0h4m-4 0l5-5m11 5l-5-5m5 5v-4m0 4h-4" />
@@ -1368,9 +1570,10 @@ const HoverEditor = forwardRef<HoverEditorHandle, HoverEditorProps>((props, ref)
                 e.stopPropagation()
                 setIsFullscreen(false)
               }}
-              className="p-1.5 hover:bg-gray-100 rounded transition-colors"
+              className="p-1.5 hover:bg-gray-50 rounded transition-colors opacity-60 hover:opacity-100"
               title="Exit fullscreen"
               onMouseDown={(e) => e.stopPropagation()}
+              onPointerDown={(e) => e.stopPropagation()}
             >
               <svg className="w-4 h-4 text-gray-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                 <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
@@ -1382,9 +1585,10 @@ const HoverEditor = forwardRef<HoverEditorHandle, HoverEditorProps>((props, ref)
                 e.stopPropagation()
                 await handleSave()
               }}
-              className="p-1.5 hover:bg-gray-100 rounded transition-colors"
+              className="p-1.5 hover:bg-gray-50 rounded transition-colors opacity-60 hover:opacity-100"
               title="Close"
               onMouseDown={(e) => e.stopPropagation()}
+              onPointerDown={(e) => e.stopPropagation()}
             >
               <svg className="w-4 h-4 text-gray-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                 <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
@@ -1422,14 +1626,14 @@ const HoverEditor = forwardRef<HoverEditorHandle, HoverEditorProps>((props, ref)
       )}
 
       {/* Editor Content */}
-      <div className="flex-1 px-6 py-6 overflow-y-auto flex flex-col" style={{ backgroundColor: '#ffffff' }}>
+      <div className="px-6 py-6 overflow-y-auto flex flex-col" style={{ backgroundColor: '#ffffff', height: `${finalEditorHeight - 180}px`, overflowY: 'auto' }}>
         {/* Body ContentEditable */}
-        <div className="flex-1">
+        <div style={{ flex: 1, overflowY: 'auto', minHeight: 0 }}>
           <div
             ref={contentEditableRef}
             contentEditable
-            onInput={(e) => {
-              handleContentChange(e)
+            onInput={() => {
+              handleContentChange()
               // Check for [[ pattern on input
               setTimeout(() => {
                 checkForLinkDropdown()
@@ -1491,7 +1695,7 @@ const HoverEditor = forwardRef<HoverEditorHandle, HoverEditorProps>((props, ref)
                 }
                 // Use setTimeout to check after the character is inserted into the DOM
                 setTimeout(() => {
-                  const converted = checkAndConvertLink()
+                  checkAndConvertLink()
                   // If link was converted, we don't need to do anything else
                   // The checkAndConvertLink already updated the HTML and body state
                 }, 10) // Small delay to ensure character is inserted
@@ -1582,16 +1786,86 @@ const HoverEditor = forwardRef<HoverEditorHandle, HoverEditorProps>((props, ref)
               setShowContextMenu(true)
               setContextMenuPos({ x: e.clientX, y: e.clientY })
             }}
-            className="w-full h-full border-none outline-none text-base text-gray-900 bg-transparent font-normal leading-relaxed focus:outline-none"
+            className="w-full h-full border-none outline-none text-base text-gray-900 bg-transparent font-normal leading-relaxed focus:outline-none overflow-y-auto"
             style={{ 
-              minHeight: `${finalEditorHeight - 150}px`,
               fontFamily: 'system-ui, -apple-system, sans-serif',
               lineHeight: '1.6'
             }}
             suppressContentEditableWarning={true}
           />
         </div>
+        
+        {/* Backlinks Section */}
+        {backlinks.length > 0 && (
+          <div className="mt-4 pt-4 border-t border-gray-200">
+            <button
+              onClick={() => setShowBacklinks(!showBacklinks)}
+              className="w-full flex items-center justify-between text-sm text-gray-600 hover:text-gray-900 transition-colors"
+            >
+              <span className="font-medium">Backlinks ({backlinks.length})</span>
+              <svg 
+                className={`w-4 h-4 transition-transform ${showBacklinks ? 'rotate-180' : ''}`}
+                fill="none" 
+                stroke="currentColor" 
+                viewBox="0 0 24 24"
+              >
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
+              </svg>
+            </button>
+            {showBacklinks && (
+              <div className="mt-2 space-y-1">
+                {backlinks.map((backlink) => (
+                  <button
+                    key={backlink.id}
+                    onClick={() => {
+                      if (onLinkClick && backlink.filePath) {
+                        const fileName = backlink.filePath.split('/').pop() || backlink.filePath
+                        const fileNameWithoutExt = fileName.endsWith('.md') ? fileName.slice(0, -3) : fileName
+                        onLinkClick(fileNameWithoutExt)
+                      }
+                    }}
+                    className="w-full text-left px-3 py-2 text-sm text-blue-600 hover:bg-blue-50 rounded transition-colors"
+                  >
+                    {backlink.title}
+                  </button>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
       </div>
+
+      {/* Footer with Canvases list */}
+      {noteCanvases.length > 0 && (
+        <div className="px-5 py-3 border-t border-gray-100 bg-white">
+          <div className="flex items-center gap-2 mb-2">
+            <svg className="w-4 h-4 text-gray-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15.172 7l-6.586 6.586a2 2 0 102.828 2.828l6.414-6.586a4 4 0 00-5.656-5.656l-6.415 6.585a6 6 0 108.486 8.486L20.5 13" />
+            </svg>
+            <span className="text-sm font-medium text-gray-700">Canvases</span>
+          </div>
+          <div className="flex flex-wrap gap-2">
+            {noteCanvases.map((canvasName) => (
+              <button
+                key={canvasName}
+                onClick={(e) => {
+                  e.stopPropagation()
+                  // Use onCanvasChange if available, otherwise fall back to onLinkClick
+                  if (onCanvasChange) {
+                    onCanvasChange(canvasName)
+                  } else if (onLinkClick) {
+                    onLinkClick(canvasName)
+                  }
+                }}
+                className="px-3 py-1.5 text-xs text-gray-700 bg-gray-50 hover:bg-gray-100 rounded transition-colors"
+                onMouseDown={(e) => e.stopPropagation()}
+              >
+                {canvasName}
+              </button>
+            ))}
+          </div>
+        </div>
+      )}
 
       {/* Formatting Toolbar */}
       {showFormatToolbar && (
@@ -1690,20 +1964,28 @@ const HoverEditor = forwardRef<HoverEditorHandle, HoverEditorProps>((props, ref)
               {linkSearchText}
             </div>
           )}
-          {availableFiles.map((file, index) => (
-            <div
-              key={file}
-              className={`px-3 py-2 text-sm cursor-pointer hover:bg-gray-100 ${
-                index === linkDropdownIndex ? 'bg-gray-100' : ''
-              }`}
-              onClick={() => {
-                insertLinkFileName(file)
-              }}
+          {availableFiles.map((file, index) => {
+            const isCanvas = canvases.includes(file)
+            return (
+              <div
+                key={file}
+                className={`px-3 py-2 text-sm cursor-pointer hover:bg-gray-100 flex items-center gap-2 ${
+                  index === linkDropdownIndex ? 'bg-gray-100' : ''
+                }`}
+                onClick={() => {
+                  insertLinkFileName(file)
+                }}
               onMouseEnter={() => setLinkDropdownIndex(index)}
-            >
-              {file}
-            </div>
-          ))}
+              >
+                {isCanvas && (
+                  <svg className="w-4 h-4 text-indigo-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9.75 17L9 20l-1 1h8l-1-1-.75-3M3 13h18M5 17h14a2 2 0 002-2V5a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z" />
+                  </svg>
+                )}
+                <span>{file}</span>
+              </div>
+            )
+          })}
         </div>
       )}
 
@@ -1762,37 +2044,22 @@ const HoverEditor = forwardRef<HoverEditorHandle, HoverEditorProps>((props, ref)
             }}
           >
             {filePath && (
-              <>
-                <button
-                  onClick={(e) => {
-                    e.stopPropagation()
-                    setIsEditingFileName(true)
-                    setShowMenu(false)
-                  }}
-                  className="w-full px-4 py-2 text-left text-sm text-gray-700 hover:bg-gray-100 transition-colors flex items-center gap-2"
-                >
-                  <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z" />
-                  </svg>
-                  Rename file
-                </button>
-                <button
-                  onClick={async (e) => {
-                    e.stopPropagation()
-                    setShowMenu(false)
-                    if (onDelete && window.confirm(`Are you sure you want to delete this note? This action cannot be undone.`)) {
-                      onDelete(note)
-                      onClose()
-                    }
-                  }}
-                  className="w-full px-4 py-2 text-left text-sm text-red-600 hover:bg-red-50 transition-colors flex items-center gap-2"
-                >
-                  <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
-                  </svg>
-                  Delete file
-                </button>
-              </>
+              <button
+                onClick={async (e) => {
+                  e.stopPropagation()
+                  setShowMenu(false)
+                  if (onDelete && window.confirm(`Are you sure you want to delete this note? This action cannot be undone.`)) {
+                    onDelete(note)
+                    onClose()
+                  }
+                }}
+                className="w-full px-4 py-2 text-left text-sm text-red-600 hover:bg-red-50 transition-colors flex items-center gap-2"
+              >
+                <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
+                </svg>
+                Delete file
+              </button>
             )}
           </div>
           <div
