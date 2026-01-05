@@ -390,11 +390,11 @@ const HoverEditor = forwardRef<HoverEditorHandle, HoverEditorProps>((props, ref)
       // Combine and sort by position
       type Element = 
         | ({ type: 'image' } & { startIndex: number; endIndex: number; path: string; alt?: string })
-        | ({ type: 'link' } & { startIndex: number; endIndex: number; fileName: string })
+        | ({ type: 'link' } & { startIndex: number; endIndex: number; fileName: string; displayText?: string })
       
       const allElements: Element[] = [
         ...images.map(img => ({ type: 'image' as const, startIndex: img.startIndex, endIndex: img.endIndex, path: img.path, alt: img.alt })),
-        ...links.map(link => ({ type: 'link' as const, startIndex: link.startIndex, endIndex: link.endIndex, fileName: link.fileName }))
+        ...links.map(link => ({ type: 'link' as const, startIndex: link.startIndex, endIndex: link.endIndex, fileName: link.fileName, displayText: link.displayText }))
       ].sort((a, b) => a.startIndex - b.startIndex)
       
       if (allElements.length === 0) {
@@ -457,7 +457,9 @@ const HoverEditor = forwardRef<HoverEditorHandle, HoverEditorProps>((props, ref)
         } else if (element.type === 'link') {
           // Create styled link span with contenteditable="false" to prevent editing inside
           const fileName = element.fileName
-          const displayText = stripFileExtension(fileName)
+          // Check if link has display text (format: [[fileName|displayText]])
+          // If no explicit display text, strip file extension for cleaner display
+          const displayText = element.displayText || stripFileExtension(fileName)
           // Check if file exists or if it's a canvas (canvases always exist)
           const isCanvas = canvases.includes(fileName)
           const fileExists = existingFiles.has(fileName) || isCanvas
@@ -1715,13 +1717,13 @@ const HoverEditor = forwardRef<HoverEditorHandle, HoverEditorProps>((props, ref)
                     try {
                       const filesResult = await listNoteFiles()
                       if (filesResult.success && filesResult.files) {
-                        const fileNames = new Set(
-                          filesResult.files.map((file: any) => {
-                            const fileName = file.name || file
-                            return fileName.endsWith('.md') ? fileName.slice(0, -3) : fileName
-                          })
-                        )
-                        setExistingFiles(fileNames)
+                        const fileNames = filesResult.files.map((file: any) => {
+                          const fileName = file.name || file
+                          return fileName.endsWith('.md') ? fileName.slice(0, -3) : fileName
+                        })
+                        const fileNamesSet = new Set(fileNames)
+                        setExistingFiles(fileNamesSet)
+                        setAllFiles(fileNames) // Update allFiles so it appears in +Link dropdown
                         // Force re-render of links with updated opacity by triggering body update
                         // The useEffect hooks will pick up the existingFiles change and re-render
                         if (contentEditableRef.current) {
